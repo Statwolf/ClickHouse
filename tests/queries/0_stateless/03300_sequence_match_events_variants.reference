@@ -51,3 +51,4 @@ Any-event pattern (.) - All count matches sequenceCount	1
 Kleene pattern (.*) - First	1
 Kleene pattern (.*) - Last	1
 Kleene pattern (.*) - All count matches sequenceCount	1
+[0,5]	[0,5]	[[0,5]]

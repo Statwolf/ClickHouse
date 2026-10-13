@@ -384,8 +384,7 @@ protected:
 
     /// `anchored`: require the match to start exactly at the given `events_it`, rather than allowing
     /// the search to silently retry starting at later events (which it otherwise does: the leading
-    /// synthetic KleeneStar in `actions`, plus the fact that every successfully matched action is
-    /// itself a backtrack point, together let the search skip ahead and match starting anywhere in
+    /// synthetic KleeneStar in `actions` lets the search skip ahead and match starting anywhere in
     /// [events_it, events_end)). Needed by callers that scan position-by-position and require the
     /// result to be tied to a specific, known anchor rather than "the best match found anywhere in
     /// the remaining suffix".
@@ -411,13 +410,10 @@ protected:
         std::vector<T> current_matched_events;
         std::vector<decltype(action_it)> current_matched_actions;
 
+        /// Records the match only. Adding a backtrack point here would let this traversal skip ahead
+        /// and accept chains the pattern does not authorise, and that the verdict traversal rejects.
         const auto do_push_event = [&]
         {
-            /// When anchored, the very first action must not be retried against a later event:
-            /// that would defeat the anchoring by effectively trying a different start position.
-            if (!anchored || action_it != action_begin)
-                back_stack.emplace(action_it, events_it, base_it);
-
             current_matched_events.push_back(events_it->first);
             current_matched_actions.push_back(action_it);
             if (best_matched_events->size() < current_matched_events.size())
@@ -428,7 +424,7 @@ protected:
 
         const auto do_revert_event_if_needed = [&]
         {
-            if (current_matched_actions.size() > 0 && current_matched_actions.back() >= action_it)
+            while (!current_matched_actions.empty() && current_matched_actions.back() >= action_it)
             {
                 current_matched_events.pop_back();
                 current_matched_actions.pop_back();

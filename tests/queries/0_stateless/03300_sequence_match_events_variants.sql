@@ -190,3 +190,10 @@ select 'Kleene pattern (.*) - Last' as test, [] = sequenceMatchEventsLast('.*')(
 select 'Kleene pattern (.*) - All count matches sequenceCount' as test, sequenceCount('.*')(time, data = 0, data = 1, data = 2, data = 3) = length(sequenceMatchEventsAll('.*')(time, data = 0, data = 1, data = 2, data = 3)) from sequence_test_variants;
 
 drop table sequence_test_variants;
+
+-- The returned chain must satisfy the time gate it is matched under (issue #118120).
+SELECT
+    sequenceMatchEventsFirst('(?1)(?t<=10)(?2)(?3)')(t, e = 'A', e = 'B', e = 'C'),
+    sequenceMatchEventsLast('(?1)(?t<=10)(?2)(?3)')(t, e = 'A', e = 'B', e = 'C'),
+    sequenceMatchEventsAll('(?1)(?t<=10)(?2)(?3)')(t, e = 'A', e = 'B', e = 'C')
+FROM values('t UInt32, e String', (0, 'A'), (5, 'B'), (100, 'B'), (101, 'C'));
