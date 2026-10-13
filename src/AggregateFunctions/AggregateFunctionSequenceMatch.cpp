@@ -32,7 +32,6 @@ namespace ErrorCodes
     extern const int TOO_MANY_ARGUMENTS_FOR_FUNCTION;
     extern const int TOO_FEW_ARGUMENTS_FOR_FUNCTION;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
-    extern const int TOO_SLOW;
     extern const int SYNTAX_ERROR;
     extern const int BAD_ARGUMENTS;
     extern const int LOGICAL_ERROR;
@@ -138,7 +137,8 @@ struct AggregateFunctionSequenceMatchData final
 };
 
 
-/// Max number of iterations to match the pattern against a sequence, exception thrown when exceeded
+/// Max number of iterations to match the pattern against a sequence. When exceeded, the search
+/// is abandoned and treated as "no match" (rather than failing the whole query).
 constexpr auto sequence_match_max_iterations = 1000000;
 
 
@@ -543,8 +543,15 @@ protected:
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown PatternActionType");
 
             if (++i > sequence_match_max_iterations)
-                throw Exception(ErrorCodes::TOO_SLOW, "Pattern application proves too difficult, exceeding max iterations ({})",
-                    sequence_match_max_iterations);
+            {
+                /// Iteration budget exhausted: give up and report "no match" instead of throwing
+                /// and failing the whole query. Any partially matched events are discarded too,
+                /// so the abandoned search contributes nothing to the result.
+                if constexpr (remember_matched_events)
+                    best_matched_events->clear();
+                events_it = events_end;
+                return false;
+            }
         }
 
         /// if there are some actions remaining
@@ -573,6 +580,10 @@ protected:
 
         return best_matched_events;
     }
+
+    /// Whether a shared iteration counter (see backtrackingMatch) has run out of budget. Once it
+    /// has, the search being performed is abandoned and treated as "no match".
+    static bool iterationBudgetExhausted(size_t iteration_count) { return iteration_count > sequence_match_max_iterations; }
 
     /// Find the first matching sequence chronologically
     template <typename EventEntry>
@@ -605,7 +616,7 @@ protected:
         /// SpecificEvent action, so letting the anchored call mutate the scan's own iterator could
         /// skip candidate positions entirely.
         auto anchor = events_it;
-        while (anchor != events_end)
+        while (anchor != events_end && !iterationBudgetExhausted(iteration_count))
         {
             auto probe_anchor = anchor;
             std::vector<T> current_match;
@@ -676,6 +687,10 @@ protected:
             std::vector<T> current_match;
             backtrackingMatch<EventEntry, true, true>(probe_anchor, events_end, &current_match, &iteration_count);
 
+            /// Budget ran out before the scan finished, so the latest partial is unknown: no match.
+            if (iterationBudgetExhausted(iteration_count))
+                return {};
+
             if (!current_match.empty())
                 last_matched_events = current_match;
 
@@ -720,6 +735,14 @@ protected:
             auto probe_anchor = anchor;
             std::vector<T> current_match;
             backtrackingMatch<EventEntry, true, true>(probe_anchor, events_end, &current_match, &iteration_count);
+
+            /// Budget ran out before the scan finished, so the latest partial is unknown: keep
+            /// only the complete matches found so far.
+            if (iterationBudgetExhausted(iteration_count))
+            {
+                trailing_partial.clear();
+                break;
+            }
 
             if (!current_match.empty())
                 trailing_partial = current_match;
@@ -771,9 +794,9 @@ protected:
                     }
                 }
 
+                /// Iteration budget exhausted: report "no match" instead of failing the whole query.
                 if (limit_iterations && ++events_processed > sequence_match_max_iterations)
-                    throw Exception(ErrorCodes::TOO_SLOW, "Pattern application proves too difficult, exceeding max iterations ({})",
-                        sequence_match_max_iterations);
+                    return false;
             }
 
             return det_part_it == actions_it;
