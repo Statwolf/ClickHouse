@@ -14,10 +14,13 @@
 #include <IO/WriteHelpers.h>
 #include <base/range.h>
 
+#include <algorithm>
 #include <bitset>
 #include <cstddef>
 #include <iterator>
-#include <stack>
+#include <limits>
+#include <numeric>
+#include <optional>
 #include <vector>
 
 
@@ -382,69 +385,432 @@ protected:
         return active_states.back();
     }
 
+    /// State shared by all backtrackingMatch calls that compute one result over the same sorted events:
+    /// the iteration budget, and a memo of the sub-searches that are known to fail.
+    ///
+    /// Without the memo, backtracking re-explores the same failing sub-searches from every start
+    /// position, which is quadratic in the number of events for a single `.*` or time condition (and
+    /// cubic for two of them), e.g. '(?1)(?t>1000)(?2)' needs ~n^2/2 steps on events that do not match.
+    ///
+    /// A sub-search ("state") is identified by the action it starts at and the index of the event it
+    /// starts at. Its outcome does not depend on how it was reached: the time base it compares against
+    /// is fixed by the previous action (the previous event after `(?N)` or `.`, the current event after
+    /// `.*` or a time condition). Once a state has been explored completely without a match, it is
+    /// recorded as failed and never explored again. So that the matched events reported by
+    /// sequenceMatchEvents* stay exactly the same, the memo also records the length of the longest
+    /// partial chain found inside each failed state and how to rebuild it: skipping a failed state
+    /// then updates `best_matched_events` exactly as exploring it would have.
+    ///
+    /// With the memo every state is explored at most once, so the total work is
+    /// O(actions * events * log(events)) instead of exponential in the number of `.*` and time conditions.
+    class BacktrackingContext
+    {
+    public:
+        static constexpr Int32 unknown = -1;
+
+        /// Per action: whether it follows `.*` or a time condition (its states are the ones such an action
+        /// retries, which are skipped in bulk), and whether it is `.*` or a time condition itself.
+        static constexpr UInt8 retried_child = 1;
+        static constexpr UInt8 retrying = 2;
+
+        BacktrackingContext(std::vector<UInt8> action_kinds_, size_t num_events_)
+            : action_kinds(std::move(action_kinds_))
+            , num_events(num_events_)
+            , memo_threshold(num_events_ < std::numeric_limits<UInt32>::max()
+                ? 64 * (action_kinds.size() + num_events_) : std::numeric_limits<size_t>::max())
+            , budget(std::max<size_t>(sequence_match_max_iterations, 64 * (action_kinds.size() + num_events_) + 16 * (action_kinds.size() + 1) * (num_events_ + 1)))
+        {
+            while (tree_size < num_events)
+                tree_size *= 2;
+        }
+
+        /// A backtrack point: an action to retry, the index of the event it was last tried at and the
+        /// index of the event its time conditions compare against.
+        struct BacktrackPoint
+        {
+            size_t action;
+            size_t event;
+            size_t base;
+        };
+
+        /// A state on the current search path that is tracked by the memo, with the longest partial
+        /// chain found so far among its completely explored children.
+        struct PathState
+        {
+            size_t action;
+            size_t event;
+            /// number of backtrack points below the state: it has failed once one of those is popped
+            size_t depth;
+            Int32 longest_child = 0;
+            size_t longest_child_event = 0;
+            /// whether the state's own action is a specific event that matched
+            bool matched = false;
+        };
+
+        /// Scratch space of backtrackingMatch, kept here so that repeated calls do not allocate.
+        std::vector<BacktrackPoint> back_stack;
+        std::vector<PathState> path;
+        std::vector<T> current_matched_events;
+        std::vector<size_t> current_matched_actions;
+
+        size_t numEvents() const { return num_events; }
+
+        /// Counts one iteration; returns false once the budget is exhausted. The memoized search needs
+        /// O(actions * events) iterations, so the budget is only a safety net against runaway searches.
+        bool step() { return ++iterations <= budget; }
+        bool exhausted() const { return iterations > budget; }
+
+        /// The memo is only switched on once the searches turned out to be expensive (realistic inputs
+        /// take a small multiple of `events` iterations without it), so that searches that do not need it
+        /// do not pay for maintaining it. Its cost is linear either way. Switching it on part way through
+        /// a search is safe: the states entered before are simply never recorded.
+        ALWAYS_INLINE bool memoEnabled()
+        {
+            if (memo_enabled || iterations < memo_threshold) [[likely]]
+                return memo_enabled;
+            memo_enabled = true;
+            per_action.resize(action_kinds.size() + 1);
+            return true;
+        }
+
+        /// Length of the longest partial chain inside the failed state (`action`, `event`), or `unknown`.
+        Int32 failedLength(size_t action, size_t event) const
+        {
+            const auto & memo = per_action[action];
+            if (!memo.lengths.empty())
+                return memo.lengths[event];
+            return memo.tree.empty() ? unknown : memo.tree[tree_size + event];
+        }
+
+        /// For a failed state starting at `.*` or a time condition: the event its longest partial chain
+        /// continues from (i.e. its first child state, in search order, holding the longest chain).
+        size_t longestChild(size_t action, size_t event) const { return per_action[action].longest_child[event]; }
+
+        void setFailed(size_t action, size_t event, Int32 length, size_t longest_child)
+        {
+            auto & memo = allocate(action);
+            if (action_kinds[action] & retried_child)
+            {
+                size_t node = tree_size + event;
+                memo.tree[node] = length;
+                for (node /= 2; node; node /= 2)
+                    memo.tree[node] = std::max(memo.tree[2 * node], memo.tree[2 * node + 1]);
+                memo.next_unknown[event] = static_cast<UInt32>(event + 1);
+            }
+            else
+                memo.lengths[event] = length;
+            if (action_kinds[action] & retrying)
+                memo.longest_child[event] = static_cast<UInt32>(longest_child);
+        }
+
+        /// First event in [from, to) whose state at `action` is not known to fail, or `to`.
+        size_t firstUnknown(size_t action, size_t from, size_t to)
+        {
+            auto & next = per_action[action].next_unknown;
+            if (next.empty())
+                return from;
+            size_t root = from;
+            while (next[root] != root)
+                root = next[root];
+            while (next[from] != root)
+            {
+                const size_t following = next[from];
+                next[from] = static_cast<UInt32>(root);
+                from = following;
+            }
+            return std::min(root, to);
+        }
+
+        /// The longest partial chain among the failed states (`action`, [from, to)), all of which must be
+        /// known to fail, and the first event holding it.
+        std::pair<Int32, size_t> longestFailed(size_t action, size_t from, size_t to) const
+        {
+            const auto & tree = per_action[action].tree;
+            Int32 longest = unknown;
+            for (size_t left = from + tree_size, right = to + tree_size; left < right; left /= 2, right /= 2)
+            {
+                if (left & 1)
+                    longest = std::max(longest, tree[left++]);
+                if (right & 1)
+                    longest = std::max(longest, tree[--right]);
+            }
+            return {longest, firstAtLeast(tree, 1, 0, tree_size, from, to, longest)};
+        }
+
+    private:
+        struct ActionMemo
+        {
+            /// For actions following `.*` or a time condition, whose states are skipped in bulk: a max
+            /// segment tree over the events, leaves holding the longest partial chain of failed states
+            /// (`unknown` for states not known to fail), and path-compressed union-find "next state not
+            /// known to fail" pointers.
+            std::vector<Int32> tree;
+            std::vector<UInt32> next_unknown;
+            /// For the other actions: the longest partial chain of failed states, or `unknown`.
+            std::vector<Int32> lengths;
+            /// For `.*` and time conditions: see longestChild.
+            std::vector<UInt32> longest_child;
+            bool allocated = false;
+        };
+
+        ActionMemo & allocate(size_t action)
+        {
+            auto & memo = per_action[action];
+            if (!memo.allocated)
+            {
+                memo.allocated = true;
+                if (action_kinds[action] & retried_child)
+                {
+                    memo.tree.assign(2 * tree_size, unknown);
+                    memo.next_unknown.resize(num_events + 1);
+                    std::iota(memo.next_unknown.begin(), memo.next_unknown.end(), UInt32{0});
+                }
+                else
+                    memo.lengths.assign(num_events, unknown);
+                if (action_kinds[action] & retrying)
+                    memo.longest_child.assign(num_events, 0);
+            }
+            return memo;
+        }
+
+        static size_t firstAtLeast(
+            const std::vector<Int32> & tree, size_t node, size_t node_from, size_t node_to, size_t from, size_t to, Int32 value)
+        {
+            if (node_to <= from || to <= node_from || tree[node] < value)
+                return to;
+            if (node_to - node_from == 1)
+                return node_from;
+            const size_t middle = (node_from + node_to) / 2;
+            const size_t found = firstAtLeast(tree, 2 * node, node_from, middle, from, to, value);
+            if (found != to)
+                return found;
+            return firstAtLeast(tree, 2 * node + 1, middle, node_to, from, to, value);
+        }
+
+        const std::vector<UInt8> action_kinds;
+        const size_t num_events;
+        const size_t memo_threshold;
+        const size_t budget;
+        size_t tree_size = 1;
+        size_t iterations = 0;
+        bool memo_enabled = false;
+        std::vector<ActionMemo> per_action;
+    };
+
+    BacktrackingContext makeBacktrackingContext(size_t num_events) const
+    {
+        std::vector<UInt8> action_kinds(actions.size(), 0);
+        for (size_t i = 0; i < actions.size(); ++i)
+        {
+            const bool retrying = actions[i].type != PatternActionType::SpecificEvent && actions[i].type != PatternActionType::AnyEvent;
+            if (retrying)
+            {
+                action_kinds[i] |= BacktrackingContext::retrying;
+                if (i + 1 < actions.size())
+                    action_kinds[i + 1] |= BacktrackingContext::retried_child;
+            }
+        }
+        return BacktrackingContext(std::move(action_kinds), num_events);
+    }
+
+    /// For a time condition being retried at `from` (the frame it was pushed at already satisfied it):
+    /// the end of the run of events from `from` on that still satisfy it. Events are sorted by time, so
+    /// `(?t<..)`, `(?t<=..)` and `(?t==..)` hold up to some point and `.*`, `(?t>..)`, `(?t>=..)` to the end.
+    template <typename EventEntry>
+    EventEntry conditionHoldsUntil(const PatternAction & condition, EventEntry from, EventEntry base, EventEntry events_end) const
+    {
+        if (condition.type == PatternActionType::TimeLess)
+            return std::lower_bound(from, events_end, base->first + condition.extra,
+                [](const auto & event, const auto & value) { return event.first < value; });
+        if (condition.type == PatternActionType::TimeLessOrEqual || condition.type == PatternActionType::TimeEqual)
+            return std::upper_bound(from, events_end, base->first + condition.extra,
+                [](const auto & value, const auto & event) { return value < event.first; });
+        return events_end;
+    }
+
+    /// For `(?t>=..)`, `(?t>..)` and `(?t==..)`: the first event from `from` on that satisfies the
+    /// condition, or events_end. Equivalent to trying the events one by one, as events are sorted by time.
+    template <typename EventEntry>
+    EventEntry firstEventSatisfying(const PatternAction & condition, EventEntry from, EventEntry base, EventEntry events_end) const
+    {
+        const auto target = base->first + condition.extra;
+
+        /// The satisfying event is usually close: look at a few events before searching all of them.
+        for (size_t probe = 0; probe < 8 && from != events_end; ++probe, ++from)
+        {
+            if (condition.type == PatternActionType::TimeGreater ? from->first > target : from->first >= target)
+                return (condition.type == PatternActionType::TimeEqual && from->first != target) ? events_end : from;
+        }
+        if (from == events_end)
+            return events_end;
+
+        if (condition.type == PatternActionType::TimeGreater)
+            return std::upper_bound(from, events_end, target, [](const auto & value, const auto & event) { return value < event.first; });
+
+        const auto found = std::lower_bound(from, events_end, target, [](const auto & event, const auto & value) { return event.first < value; });
+        if (condition.type == PatternActionType::TimeEqual && found != events_end && found->first != target)
+            return events_end;
+        return found;
+    }
+
     /// `anchored`: require the match to start exactly at the given `events_it`, rather than allowing
     /// the search to silently retry starting at later events (which it otherwise does: the leading
     /// synthetic KleeneStar in `actions` lets the search skip ahead and match starting anywhere in
     /// [events_it, events_end)). Needed by callers that scan position-by-position and require the
     /// result to be tied to a specific, known anchor rather than "the best match found anywhere in
     /// the remaining suffix".
-    /// `shared_iteration_count`: when set, callers that make several backtrackingMatch calls to
-    /// compute a single result (e.g. a position-by-position anchored scan) can pass the same
-    /// counter into every call so `sequence_match_max_iterations` bounds the *total* work for that
-    /// one result, rather than resetting - and so no longer actually bounding anything - on each
-    /// individual call.
+    /// `shared_context`: callers that make several backtrackingMatch calls over the same events to
+    /// compute a single result (sequenceCount, or a position-by-position anchored scan) pass the same
+    /// context into every call, so that the iteration budget bounds the *total* work for that result
+    /// and the memo of failed states is reused across the calls. Its events must end at `events_end`.
+    ///
+    /// The search is a depth-first backtracking search: `.*` and time conditions push a backtrack point
+    /// that retries them at the next event. On top of it (see BacktrackingContext), states known to fail
+    /// are skipped, and `(?t>..)`/`(?t>=..)`/`(?t==..)` jump to the first satisfying event by binary
+    /// search. Neither changes what the search returns, only how much work it does.
     template <typename EventEntry, bool remember_matched_events = false, bool anchored = false>
-    bool backtrackingMatch(EventEntry & events_it, const EventEntry events_end, std::vector<T> * best_matched_events = nullptr, size_t * shared_iteration_count = nullptr) const
+    bool backtrackingMatch(
+        EventEntry & events_it,
+        const EventEntry events_end,
+        std::vector<T> * best_matched_events = nullptr,
+        BacktrackingContext * shared_context = nullptr) const
     {
-        const auto action_begin = anchored ? std::next(std::begin(actions)) : std::begin(actions);
-        const auto action_end = std::end(actions);
-        auto action_it = action_begin;
+        std::optional<BacktrackingContext> local_context;
+        if (!shared_context)
+            shared_context = &local_context.emplace(makeBacktrackingContext(static_cast<size_t>(events_end - events_it)));
+        BacktrackingContext & context = *shared_context;
+
+        /// The memo addresses events by index: the context's events end at `events_end`.
+        const auto events_origin = events_end - context.numEvents();
+        const auto index_of = [&](EventEntry it) ALWAYS_INLINE { return static_cast<size_t>(it - events_origin); };
+
+        const size_t num_actions = actions.size();
+        size_t action = anchored ? 1 : 0;
 
         const auto events_begin = events_it;
         auto base_it = events_it;
 
-        /// an iterator to action plus an iterator to row in events list plus timestamp at the start of sequence
-        using backtrack_info = std::tuple<decltype(action_it), EventEntry, EventEntry>;
-        std::stack<backtrack_info> back_stack;
+        using BacktrackPoint = typename BacktrackingContext::BacktrackPoint;
+        using PathState = typename BacktrackingContext::PathState;
 
-        std::vector<T> current_matched_events;
-        std::vector<decltype(action_it)> current_matched_actions;
+        auto & back_stack = context.back_stack;
+        auto & current_matched_events = context.current_matched_events;
+        auto & current_matched_actions = context.current_matched_actions;
+        /// The states on the current search path that are tracked by the memo (always a suffix of the path).
+        auto & path = context.path;
+        back_stack.clear();
+        current_matched_events.clear();
+        current_matched_actions.clear();
+        path.clear();
 
-        /// Records the match only. Adding a backtrack point here would let this traversal skip ahead
-        /// and accept chains the pattern does not authorise, and that the verdict traversal rejects.
-        const auto do_push_event = [&]
+        [[maybe_unused]] const auto rebuild_chain = [&](size_t chain_action, size_t chain_event, Int32 length)
+        {
+            for (Int32 rebuilt = 0; rebuilt < length; ++chain_action)
+            {
+                const auto type = actions[chain_action].type;
+                if (type == PatternActionType::SpecificEvent)
+                {
+                    best_matched_events->push_back((events_origin + chain_event)->first);
+                    ++rebuilt;
+                    ++chain_event;
+                }
+                else if (type == PatternActionType::AnyEvent)
+                    ++chain_event;
+                else
+                    chain_event = context.longestChild(chain_action, chain_event);
+            }
+        };
+
+        const auto add_child = [&](Int32 length, size_t child_event) ALWAYS_INLINE
+        {
+            if (!path.empty() && length > path.back().longest_child)
+            {
+                path.back().longest_child = length;
+                path.back().longest_child_event = child_event;
+            }
+        };
+
+        /// A child state (`child_action`, `child_event`) of the last state on the path is known to fail:
+        /// account for it exactly as if it had been explored again.
+        const auto skip_failed_child = [&]([[maybe_unused]] size_t child_action, Int32 length, size_t child_event)
+        {
+            add_child(length, child_event);
+            if constexpr (remember_matched_events)
+            {
+                if (length > 0 && current_matched_events.size() + length > best_matched_events->size())
+                {
+                    best_matched_events->assign(current_matched_events.begin(), current_matched_events.end());
+                    rebuild_chain(child_action, child_event, length);
+                }
+            }
+        };
+
+        /// Every tracked state above `depth` backtrack points has now been explored completely.
+        const auto record_failed = [&](size_t depth)
+        {
+            while (!path.empty() && path.back().depth > depth)
+            {
+                const PathState state = path.back();
+                path.pop_back();
+                const Int32 length = state.longest_child + (state.matched ? 1 : 0);
+                context.setFailed(state.action, state.event, length, state.longest_child_event);
+                add_child(length, state.event);
+            }
+        };
+
+        /// Matched events are recorded only. Adding a backtrack point here would let this traversal skip
+        /// ahead and accept chains the pattern does not authorise, and that the verdict traversal rejects.
+        [[maybe_unused]] const auto do_push_event = [&]() ALWAYS_INLINE
         {
             current_matched_events.push_back(events_it->first);
-            current_matched_actions.push_back(action_it);
+            current_matched_actions.push_back(action);
             if (best_matched_events->size() < current_matched_events.size())
-            {
                 best_matched_events->assign(current_matched_events.begin(), current_matched_events.end());
-            }
         };
 
-        const auto do_revert_event_if_needed = [&]
-        {
-            while (!current_matched_actions.empty() && current_matched_actions.back() >= action_it)
-            {
-                current_matched_events.pop_back();
-                current_matched_actions.pop_back();
-            }
-        };
         /// backtrack if possible
         const auto do_backtrack = [&]
         {
             while (!back_stack.empty())
             {
-                auto & top = back_stack.top();
+                const BacktrackPoint point = back_stack.back();
+                back_stack.pop_back();
 
-                action_it = std::get<0>(top);
-                events_it = std::next(std::get<1>(top));
-                base_it = std::get<2>(top);
+                action = point.action;
+                events_it = events_origin + (point.event + 1);
+                base_it = events_origin + point.base;
 
-                back_stack.pop();
+                const bool use_memo = context.memoEnabled();
+                if (use_memo)
+                    record_failed(back_stack.size());
 
                 if constexpr (remember_matched_events)
-                    do_revert_event_if_needed();
+                {
+                    while (!current_matched_actions.empty() && current_matched_actions.back() >= action)
+                    {
+                        current_matched_events.pop_back();
+                        current_matched_actions.pop_back();
+                    }
+                }
+
+                /// `.*` or a time condition is retried at the next events: skip those whose child state is
+                /// known to fail, as if each had been tried in turn. Only within the run of events for which
+                /// the condition still holds, as the search stops retrying at the first one that fails it.
+                if (use_memo && events_it != events_end)
+                {
+                    const size_t from = index_of(events_it);
+                    const size_t to = index_of(conditionHoldsUntil(actions[action], events_it, base_it, events_end));
+                    if (from < to)
+                    {
+                        const size_t first_unknown = context.firstUnknown(action + 1, from, to);
+                        if (first_unknown > from)
+                        {
+                            const auto [length, child_event] = context.longestFailed(action + 1, from, first_unknown);
+                            skip_failed_child(action + 1, length, child_event);
+                            events_it = events_origin + first_unknown;
+                        }
+                    }
+                }
 
                 if (events_it != events_end)
                     return true;
@@ -453,96 +819,112 @@ protected:
             return false;
         };
 
-        size_t local_iteration_count = 0;
-        size_t & i = shared_iteration_count ? *shared_iteration_count : local_iteration_count;
-        while (action_it != action_end && events_it != events_end)
+        /// Called whenever the search moves on to the next action; returns false if the search is over.
+        const auto enter_state = [&]() ALWAYS_INLINE
         {
-            if (action_it->type == PatternActionType::SpecificEvent)
+            if (action == num_actions || events_it == events_end || !context.memoEnabled())
+                return true;
+
+            const size_t event = index_of(events_it);
+            const Int32 failed_length = context.failedLength(action, event);
+            /// With no backtrack point below, a failure ends the whole search, and what it returns also
+            /// depends on the states explored inside it: explore it rather than skip it.
+            if (failed_length != BacktrackingContext::unknown && !back_stack.empty())
             {
-                if (events_it->second.test(action_it->extra))
+                skip_failed_child(action, failed_length, event);
+                return do_backtrack();
+            }
+
+            path.push_back({.action = action, .event = event, .depth = back_stack.size()});
+            return true;
+        };
+
+        enter_state();
+        while (action != num_actions && events_it != events_end)
+        {
+            const PatternAction & current = actions[action];
+            if (current.type == PatternActionType::SpecificEvent)
+            {
+                if (events_it->second.test(current.extra))
                 {
                     if constexpr (remember_matched_events)
                         do_push_event();
+                    if (!path.empty() && path.back().action == action && path.back().event == index_of(events_it))
+                        path.back().matched = true;
 
                     /// move to the next action and events
                     base_it = events_it;
-                    ++action_it, ++events_it;
+                    ++action, ++events_it;
+                    if (!enter_state())
+                        break;
                 }
                 else if (!do_backtrack())
                     /// backtracking failed, bail out
                     break;
             }
-            else if (action_it->type == PatternActionType::AnyEvent)
+            else if (current.type == PatternActionType::AnyEvent)
             {
                 base_it = events_it;
-                ++action_it, ++events_it;
+                ++action, ++events_it;
+                if (!enter_state())
+                    break;
             }
-            else if (action_it->type == PatternActionType::KleeneStar)
+            else if (current.type == PatternActionType::KleeneStar)
             {
-                back_stack.emplace(action_it, events_it, base_it);
+                back_stack.push_back({action, index_of(events_it), index_of(base_it)});
                 base_it = events_it;
-                ++action_it;
+                ++action;
+                if (!enter_state())
+                    break;
             }
-            else if (action_it->type == PatternActionType::TimeLessOrEqual)
+            else if (current.type == PatternActionType::TimeLessOrEqual || current.type == PatternActionType::TimeLess)
             {
-                if (events_it->first <= base_it->first + action_it->extra)
+                const bool satisfied = current.type == PatternActionType::TimeLessOrEqual
+                    ? events_it->first <= base_it->first + current.extra
+                    : events_it->first < base_it->first + current.extra;
+                if (satisfied)
                 {
                     /// condition satisfied, move onto next action
-                    back_stack.emplace(action_it, events_it, base_it);
+                    back_stack.push_back({action, index_of(events_it), index_of(base_it)});
                     base_it = events_it;
-                    ++action_it;
+                    ++action;
+                    if (!enter_state())
+                        break;
                 }
                 else if (!do_backtrack())
                     break;
             }
-            else if (action_it->type == PatternActionType::TimeLess)
+            else if (current.type == PatternActionType::TimeGreaterOrEqual || current.type == PatternActionType::TimeGreater
+                || current.type == PatternActionType::TimeEqual)
             {
-                if (events_it->first < base_it->first + action_it->extra)
+                bool satisfied = false;
+                if (current.type == PatternActionType::TimeGreaterOrEqual)
+                    satisfied = events_it->first >= base_it->first + current.extra;
+                else if (current.type == PatternActionType::TimeGreater)
+                    satisfied = events_it->first > base_it->first + current.extra;
+                else
+                    satisfied = events_it->first == base_it->first + current.extra;
+
+                if (satisfied)
                 {
-                    back_stack.emplace(action_it, events_it, base_it);
+                    back_stack.push_back({action, index_of(events_it), index_of(base_it)});
                     base_it = events_it;
-                    ++action_it;
+                    ++action;
+                    if (!enter_state())
+                        break;
                 }
-                else if (!do_backtrack())
-                    break;
-            }
-            else if (action_it->type == PatternActionType::TimeGreaterOrEqual)
-            {
-                if (events_it->first >= base_it->first + action_it->extra)
+                else
                 {
-                    back_stack.emplace(action_it, events_it, base_it);
-                    base_it = events_it;
-                    ++action_it;
+                    /// skip straight to the first later event satisfying the condition
+                    events_it = firstEventSatisfying(current, std::next(events_it), base_it, events_end);
+                    if (events_it == events_end && !do_backtrack())
+                        break;
                 }
-                else if (++events_it == events_end && !do_backtrack())
-                    break;
-            }
-            else if (action_it->type == PatternActionType::TimeGreater)
-            {
-                if (events_it->first > base_it->first + action_it->extra)
-                {
-                    back_stack.emplace(action_it, events_it, base_it);
-                    base_it = events_it;
-                    ++action_it;
-                }
-                else if (++events_it == events_end && !do_backtrack())
-                    break;
-            }
-            else if (action_it->type == PatternActionType::TimeEqual)
-            {
-                if (events_it->first == base_it->first + action_it->extra)
-                {
-                    back_stack.emplace(action_it, events_it, base_it);
-                    base_it = events_it;
-                    ++action_it;
-                }
-                else if (++events_it == events_end && !do_backtrack())
-                    break;
             }
             else
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown PatternActionType");
 
-            if (++i > sequence_match_max_iterations)
+            if (!context.step())
             {
                 /// Iteration budget exhausted: give up and report "no match" instead of throwing
                 /// and failing the whole query. Any partially matched events are discarded too,
@@ -555,17 +937,17 @@ protected:
         }
 
         /// match multiple empty strings at end
-        while (action_it != action_end
-            && (action_it->type == PatternActionType::KleeneStar
-                || action_it->type == PatternActionType::TimeLessOrEqual
-                || action_it->type == PatternActionType::TimeLess
-                || (action_it->type == PatternActionType::TimeGreaterOrEqual && action_it->extra == 0)))
-            ++action_it;
+        while (action != num_actions
+            && (actions[action].type == PatternActionType::KleeneStar
+                || actions[action].type == PatternActionType::TimeLessOrEqual
+                || actions[action].type == PatternActionType::TimeLess
+                || (actions[action].type == PatternActionType::TimeGreaterOrEqual && actions[action].extra == 0)))
+            ++action;
 
         if (events_it == events_begin)
             ++events_it;
 
-        return action_it == action_end;
+        return action == num_actions;
     }
 
     template <typename EventEntry>
@@ -578,19 +960,15 @@ protected:
         return best_matched_events;
     }
 
-    /// Whether a shared iteration counter (see backtrackingMatch) has run out of budget. Once it
-    /// has, the search being performed is abandoned and treated as "no match".
-    static bool iterationBudgetExhausted(size_t iteration_count) { return iteration_count > sequence_match_max_iterations; }
-
     /// Find the first matching sequence chronologically
     template <typename EventEntry>
     std::vector<T> backtrackingMatchEventsFirst(EventEntry & events_it, const EventEntry events_end) const
     {
-        /// Shared across every backtrackingMatch call made below so sequence_match_max_iterations
-        /// bounds the *total* work for this one result, not just each individual call - otherwise a
+        /// Shared across every backtrackingMatch call made below so the iteration budget bounds the
+        /// *total* work for this one result, not just each individual call - otherwise a
         /// position-by-position scan could do unbounded work overall despite each call on its own
-        /// staying under the limit.
-        size_t iteration_count = 0;
+        /// staying under the limit - and so the memo of failed states is reused by all of them.
+        auto context = makeBacktrackingContext(static_cast<size_t>(events_end - events_it));
 
         /// A plain (unanchored) call already correctly finds the earliest-starting *complete* match
         /// if one exists anywhere: backtracking explores start positions in strict left-to-right
@@ -598,7 +976,7 @@ protected:
         /// that starts earlier in favor of one that starts later. Try that first.
         auto probe_it = events_it;
         std::vector<T> whole_match;
-        if (backtrackingMatch<EventEntry, true>(probe_it, events_end, &whole_match, &iteration_count))
+        if (backtrackingMatch<EventEntry, true>(probe_it, events_end, &whole_match, &context))
             return whole_match;
 
         /// No complete match exists anywhere. Fall back to the earliest partial, testing each
@@ -613,11 +991,11 @@ protected:
         /// SpecificEvent action, so letting the anchored call mutate the scan's own iterator could
         /// skip candidate positions entirely.
         auto anchor = events_it;
-        while (anchor != events_end && !iterationBudgetExhausted(iteration_count))
+        while (anchor != events_end && !context.exhausted())
         {
             auto probe_anchor = anchor;
             std::vector<T> current_match;
-            backtrackingMatch<EventEntry, true, true>(probe_anchor, events_end, &current_match, &iteration_count);
+            backtrackingMatch<EventEntry, true, true>(probe_anchor, events_end, &current_match, &context);
 
             if (!current_match.empty())
                 return current_match;
@@ -639,7 +1017,7 @@ protected:
         bool found_complete_match = false;
 
         /// Shared across every backtrackingMatch call made below (see backtrackingMatchEventsFirst).
-        size_t iteration_count = 0;
+        auto context = makeBacktrackingContext(static_cast<size_t>(events_end - events_it));
 
         /// Phase 1: collect complete matches via plain (unanchored) calls. A complete match is
         /// always unambiguous (backtracking stops the instant one completes), so this reliably
@@ -649,7 +1027,7 @@ protected:
         {
             auto anchor = events_it_copy;
             std::vector<T> current_match;
-            bool match_result = backtrackingMatch<EventEntry, true>(events_it_copy, events_end, &current_match, &iteration_count);
+            bool match_result = backtrackingMatch<EventEntry, true>(events_it_copy, events_end, &current_match, &context);
 
             if (match_result)
             {
@@ -682,10 +1060,10 @@ protected:
         {
             auto probe_anchor = anchor;
             std::vector<T> current_match;
-            backtrackingMatch<EventEntry, true, true>(probe_anchor, events_end, &current_match, &iteration_count);
+            backtrackingMatch<EventEntry, true, true>(probe_anchor, events_end, &current_match, &context);
 
             /// Budget ran out before the scan finished, so the latest partial is unknown: no match.
-            if (iterationBudgetExhausted(iteration_count))
+            if (context.exhausted())
                 return {};
 
             if (!current_match.empty())
@@ -704,14 +1082,14 @@ protected:
         std::vector<std::vector<T>> all_matches;
 
         /// Shared across every backtrackingMatch call made below (see backtrackingMatchEventsFirst).
-        size_t iteration_count = 0;
+        auto context = makeBacktrackingContext(static_cast<size_t>(events_end - events_it));
 
         /// Phase 1: collect complete matches via plain (unanchored) calls (see backtrackingMatchEventsLast).
         while (events_it != events_end)
         {
             auto anchor = events_it;
             std::vector<T> current_match;
-            bool match_result = backtrackingMatch<EventEntry, true>(events_it, events_end, &current_match, &iteration_count);
+            bool match_result = backtrackingMatch<EventEntry, true>(events_it, events_end, &current_match, &context);
 
             if (match_result)
             {
@@ -731,11 +1109,11 @@ protected:
         {
             auto probe_anchor = anchor;
             std::vector<T> current_match;
-            backtrackingMatch<EventEntry, true, true>(probe_anchor, events_end, &current_match, &iteration_count);
+            backtrackingMatch<EventEntry, true, true>(probe_anchor, events_end, &current_match, &context);
 
             /// Budget ran out before the scan finished, so the latest partial is unknown: keep
             /// only the complete matches found so far.
-            if (iterationBudgetExhausted(iteration_count))
+            if (context.exhausted())
             {
                 trailing_partial.clear();
                 break;
@@ -757,16 +1135,15 @@ protected:
     /// ignoring the non-deterministic fragments.
     /// This function can quickly check that a full match is not possible if some deterministic fragment is missing.
     template <typename EventEntry>
-    bool couldMatchDeterministicParts(const EventEntry events_begin, const EventEntry events_end, bool limit_iterations = true) const
+    bool couldMatchDeterministicParts(const EventEntry events_begin, const EventEntry events_end) const
     {
-        size_t events_processed = 0;
         auto events_it = events_begin;
 
         const auto actions_end = std::end(actions);
         auto actions_it = std::begin(actions);
         auto det_part_begin = actions_it;
 
-        auto match_deterministic_part = [&events_it, events_end, &events_processed, det_part_begin, actions_it, limit_iterations]()
+        auto match_deterministic_part = [&events_it, events_end, det_part_begin, actions_it]()
         {
             auto events_it_init = events_it;
             auto det_part_it = det_part_begin;
@@ -790,10 +1167,6 @@ protected:
                         det_part_it = det_part_begin;
                     }
                 }
-
-                /// Iteration budget exhausted: report "no match" instead of failing the whole query.
-                if (limit_iterations && ++events_processed > sequence_match_max_iterations)
-                    return false;
             }
 
             return det_part_it == actions_it;
@@ -1137,7 +1510,9 @@ private:
         // check if there is a chance of matching the sequence at least once
         if (this->couldMatchDeterministicParts(events_begin, events_end))
         {
-            while (events_it != events_end && this->backtrackingMatch(events_it, events_end))
+            /// One context for all the calls, so the memo of failed states is shared by them.
+            auto context = this->makeBacktrackingContext(static_cast<size_t>(events_end - events_begin));
+            while (events_it != events_end && this->backtrackingMatch(events_it, events_end, nullptr, &context))
                 ++count;
         }
 
