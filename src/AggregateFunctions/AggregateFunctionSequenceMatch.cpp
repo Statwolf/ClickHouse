@@ -7,7 +7,16 @@
 #include <AggregateFunctions/IAggregateFunction.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypeFactory.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeTuple.h>
+#include <DataTypes/DataTypeObject.h>
 #include <Columns/ColumnsNumber.h>
+#include <Columns/ColumnNullable.h>
+#include <Columns/ColumnTuple.h>
+#include <Columns/ColumnArray.h>
+#include <Common/Arena.h>
+#include <IO/VarInt.h>
 #include <Common/assert_cast.h>
 #include "Functions/array/length.h"
 #include <IO/ReadHelpers.h>
@@ -57,6 +66,9 @@ struct ComparePairFirst final
 
 constexpr size_t max_events = 32;
 
+/// Matched events as indices into the (sorted) events list of the state.
+using EventIndices = std::vector<size_t>;
+
 template <typename T>
 struct AggregateFunctionSequenceMatchData final
 {
@@ -64,6 +76,8 @@ struct AggregateFunctionSequenceMatchData final
     using Events = std::bitset<max_events>;
     using TimestampEvents = std::pair<Timestamp, Events>;
     using Comparator = ComparePairFirst<std::less>;
+
+    static constexpr bool stores_captures = false;
 
     bool sorted = true;
     PODArrayWithStackMemory<TimestampEvents, 64> events_list;
@@ -81,7 +95,7 @@ struct AggregateFunctionSequenceMatchData final
         }
     }
 
-    void merge(const AggregateFunctionSequenceMatchData & other)
+    void merge(const AggregateFunctionSequenceMatchData & other, Arena *)
     {
         if (other.events_list.empty())
             return;
@@ -112,7 +126,7 @@ struct AggregateFunctionSequenceMatchData final
         }
     }
 
-    void deserialize(ReadBuffer & buf)
+    void deserialize(ReadBuffer & buf, Arena *)
     {
         readBinary(sorted, buf);
 
@@ -141,6 +155,171 @@ struct AggregateFunctionSequenceMatchData final
 };
 
 
+/// State of the sequenceMatchEvents*WithCapture functions: the events, plus for every condition an
+/// event satisfies, the value of that condition's capture argument on the event's row.
+///
+/// Capture values are JSON values serialized into the aggregation arena with
+/// IColumn::serializeValueIntoArena (as groupArray does for non-trivial types), so sorting the events
+/// only moves small entries and only the captures of matched events are ever read back.
+template <typename T>
+struct AggregateFunctionSequenceMatchCaptureData final
+{
+    using Timestamp = T;
+    using Events = std::bitset<max_events>;
+
+    /// `first` and `second` as in the std::pair the matcher reads for the other functions.
+    struct TimestampEvents
+    {
+        Timestamp first;
+        Events second;
+        /// index in `captures` of the capture of this event's lowest set condition
+        UInt64 captures_offset;
+    };
+
+    struct Comparator
+    {
+        bool operator()(const TimestampEvents & lhs, const TimestampEvents & rhs) const { return lhs.first < rhs.first; }
+    };
+
+    static constexpr bool stores_captures = true;
+
+    bool sorted = true;
+    PODArrayWithStackMemory<TimestampEvents, 64> events_list;
+    /// One per set condition of each event, in condition order; an empty StringRef is a NULL capture.
+    PODArrayWithStackMemory<StringRef, 64> captures;
+    /// sequenceMatch conditions met at least once in events_list
+    Events conditions_met;
+
+    static StringRef serializeCapture(const IColumn & column, size_t row_num, Arena & arena)
+    {
+        const IColumn * values = &column;
+        if (const auto * nullable = typeid_cast<const ColumnNullable *>(values))
+        {
+            if (nullable->isNullAt(row_num))
+                return {};
+            values = &nullable->getNestedColumn();
+        }
+        const char * begin = nullptr;
+        return values->serializeValueIntoArena(row_num, arena, begin);
+    }
+
+    static StringRef copyCapture(StringRef capture, Arena & arena)
+    {
+        if (!capture.size)
+            return {};
+        return {arena.insert(capture.data, capture.size), capture.size};
+    }
+
+    /// `capture_columns[i]` is the capture argument of condition i.
+    void add(const Timestamp timestamp, const Events & events, const IColumn ** capture_columns, size_t row_num, Arena & arena)
+    {
+        /// store information exclusively for rows with at least one event
+        if (!events.any())
+            return;
+
+        events_list.push_back(TimestampEvents{timestamp, events, captures.size()});
+        for (size_t condition = 0; condition < max_events; ++condition)
+            if (events.test(condition))
+                captures.push_back(serializeCapture(*capture_columns[condition], row_num, arena));
+        sorted = false;
+        conditions_met |= events;
+    }
+
+    void merge(const AggregateFunctionSequenceMatchCaptureData & other, Arena * arena)
+    {
+        if (other.events_list.empty())
+            return;
+
+        const size_t captures_shift = captures.size();
+        for (const auto & event : other.events_list)
+            events_list.push_back(TimestampEvents{event.first, event.second, event.captures_offset + captures_shift});
+        for (const auto & capture : other.captures)
+            captures.push_back(copyCapture(capture, *arena));
+        sorted = false;
+        conditions_met |= other.conditions_met;
+    }
+
+    void sort()
+    {
+        if (sorted)
+            return;
+
+        ::sort(std::begin(events_list), std::end(events_list), Comparator{});
+        sorted = true;
+    }
+
+    /// The capture of `condition` (which the event satisfies) on the event at `event_index`.
+    StringRef capture(size_t event_index, size_t condition) const
+    {
+        const auto & event = events_list[event_index];
+        const Events lower_conditions = event.second & Events((UInt64{1} << condition) - 1);
+        return captures[event.captures_offset + lower_conditions.count()];
+    }
+
+    void serialize(WriteBuffer & buf) const
+    {
+        writeBinary(sorted, buf);
+        writeBinary(events_list.size(), buf);
+
+        for (size_t i = 0; i < events_list.size(); ++i)
+        {
+            const auto & event = events_list[i];
+            writeBinary(event.first, buf);
+            writeBinary(event.second.to_ulong(), buf);
+            for (size_t condition = 0; condition < max_events; ++condition)
+            {
+                if (!event.second.test(condition))
+                    continue;
+                const StringRef value = capture(i, condition);
+                writeVarUInt(value.size, buf);
+                buf.write(value.data, value.size);
+            }
+        }
+    }
+
+    void deserialize(ReadBuffer & buf, Arena * arena)
+    {
+        readBinary(sorted, buf);
+
+        size_t size = 0;
+        readBinary(size, buf);
+
+        /// As for the other functions' state: the flags are not serialized.
+        conditions_met.set();
+
+        events_list.clear();
+        captures.clear();
+        events_list.reserve(size);
+
+        for (size_t i = 0; i < size; ++i)
+        {
+            Timestamp timestamp{};
+            readBinary(timestamp, buf);
+
+            UInt64 events = 0;
+            readBinary(events, buf);
+
+            events_list.push_back(TimestampEvents{timestamp, Events{events}, captures.size()});
+            for (size_t condition = 0; condition < max_events; ++condition)
+            {
+                if (!((events >> condition) & 1))
+                    continue;
+                size_t value_size = 0;
+                readVarUInt(value_size, buf);
+                if (!value_size)
+                {
+                    captures.push_back(StringRef{});
+                    continue;
+                }
+                char * value = arena->alloc(value_size);
+                buf.readStrict(value, value_size);
+                captures.push_back(StringRef{value, value_size});
+            }
+        }
+    }
+};
+
+
 /// Max number of iterations to match the pattern against a sequence. When exceeded, the search
 /// is abandoned and treated as "no match" (rather than failing the whole query).
 constexpr auto sequence_match_max_iterations = 1000000;
@@ -150,31 +329,37 @@ template <typename T, typename Data, typename Derived>
 class AggregateFunctionSequenceBase : public IAggregateFunctionDataHelper<Data, Derived>
 {
 public:
-    AggregateFunctionSequenceBase(const DataTypes & arguments, const Array & params, const String & pattern_, const DataTypePtr & result_type_)
+    /// `num_conditions_`: how many arguments after the timestamp are conditions (default: all of them;
+    /// the WithCapture functions have one capture argument per condition after the conditions).
+    AggregateFunctionSequenceBase(const DataTypes & arguments, const Array & params, const String & pattern_, const DataTypePtr & result_type_,
+        size_t num_conditions_ = std::numeric_limits<size_t>::max())
         : IAggregateFunctionDataHelper<Data, Derived>(arguments, params, result_type_)
         , pattern(pattern_)
     {
-        arg_count = arguments.size();
+        num_conditions = num_conditions_ == std::numeric_limits<size_t>::max() ? arguments.size() - 1 : num_conditions_;
         parsePattern();
     }
 
-    void add(AggregateDataPtr __restrict place, const IColumn ** columns, const size_t row_num, Arena *) const override
+    void add(AggregateDataPtr __restrict place, const IColumn ** columns, const size_t row_num, Arena * arena) const override
     {
         const auto timestamp = assert_cast<const ColumnVector<T> *>(columns[0])->getData()[row_num];
 
         typename Data::Events events;
-        for (const auto i : collections::range(1, arg_count))
+        for (const auto i : collections::range(1, num_conditions + 1))
         {
             const auto event = assert_cast<const ColumnUInt8 *>(columns[i])->getData()[row_num];
             events.set(i - 1, event);
         }
 
-        this->data(place).add(timestamp, events);
+        if constexpr (Data::stores_captures)
+            this->data(place).add(timestamp, events, columns + 1 + num_conditions, row_num, *arena);
+        else
+            this->data(place).add(timestamp, events);
     }
 
-    void merge(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs, Arena *) const override
+    void merge(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs, Arena * arena) const override
     {
-        this->data(place).merge(this->data(rhs));
+        this->data(place).merge(this->data(rhs), arena);
     }
 
     void serialize(ConstAggregateDataPtr __restrict place, WriteBuffer & buf, std::optional<size_t> /* version */) const override
@@ -182,9 +367,9 @@ public:
         this->data(place).serialize(buf);
     }
 
-    void deserialize(AggregateDataPtr __restrict place, ReadBuffer & buf, std::optional<size_t> /* version */, Arena *) const override
+    void deserialize(AggregateDataPtr __restrict place, ReadBuffer & buf, std::optional<size_t> /* version */, Arena * arena) const override
     {
-        this->data(place).deserialize(buf);
+        this->data(place).deserialize(buf, arena);
     }
 
     bool haveSameStateRepresentationImpl(const IAggregateFunction & rhs) const override
@@ -227,6 +412,7 @@ private:
     {
         actions.clear();
         actions.emplace_back(PatternActionType::KleeneStar);
+        step_conditions.clear();
 
         dfa_states.clear();
         dfa_states.emplace_back(true);
@@ -356,10 +542,11 @@ private:
                     if (pos == prev_pos)
                         throw_exception("Could not parse number");
 
-                    if (event_number > arg_count - 1)
+                    if (event_number > num_conditions)
                         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Event number {} is out of range", event_number);
 
                     actions.emplace_back(PatternActionType::SpecificEvent, event_number - 1);
+                    step_conditions.push_back(event_number - 1);
                     dfa_states.back().transition = DFATransition::SpecificEvent;
                     dfa_states.back().event = static_cast<uint32_t>(event_number - 1);
                     dfa_states.emplace_back();
@@ -516,7 +703,7 @@ protected:
         /// Scratch space of backtrackingMatch, kept here so that repeated calls do not allocate.
         std::vector<BacktrackPoint> back_stack;
         std::vector<PathState> path;
-        std::vector<T> current_matched_events;
+        EventIndices current_matched_events;
         std::vector<size_t> current_matched_actions;
 
         size_t numEvents() const { return num_events; }
@@ -754,7 +941,7 @@ protected:
     bool backtrackingMatch(
         EventEntry & events_it,
         const EventEntry events_end,
-        std::vector<T> * best_matched_events = nullptr,
+        EventIndices * best_matched_events = nullptr,
         BacktrackingContext * shared_context = nullptr) const
     {
         std::optional<BacktrackingContext> local_context;
@@ -792,7 +979,7 @@ protected:
                 const auto type = actions[chain_action].type;
                 if (type == PatternActionType::SpecificEvent)
                 {
-                    best_matched_events->push_back((events_origin + chain_event)->first);
+                    best_matched_events->push_back(chain_event);
                     ++rebuilt;
                     ++chain_event;
                 }
@@ -844,7 +1031,7 @@ protected:
         /// ahead and accept chains the pattern does not authorise, and that the verdict traversal rejects.
         [[maybe_unused]] const auto do_push_event = [&]() ALWAYS_INLINE
         {
-            current_matched_events.push_back(events_it->first);
+            current_matched_events.push_back(index_of(events_it));
             current_matched_actions.push_back(action);
             if (best_matched_events->size() < current_matched_events.size())
                 best_matched_events->assign(current_matched_events.begin(), current_matched_events.end());
@@ -1057,10 +1244,10 @@ protected:
     }
 
     template <typename EventEntry>
-    std::vector<T> backtrackingMatchEvents(EventEntry & events_it, const EventEntry events_end) const
+    EventIndices backtrackingMatchEvents(EventEntry & events_it, const EventEntry events_end) const
     {
 
-        std::vector<T> best_matched_events;
+        EventIndices best_matched_events;
         backtrackingMatch<EventEntry, true>(events_it, events_end, &best_matched_events);
 
         return best_matched_events;
@@ -1068,7 +1255,7 @@ protected:
 
     /// Find the first matching sequence chronologically
     template <typename EventEntry>
-    std::vector<T> backtrackingMatchEventsFirst(EventEntry & events_it, const EventEntry events_end) const
+    EventIndices backtrackingMatchEventsFirst(EventEntry & events_it, const EventEntry events_end) const
     {
         /// Shared across every backtrackingMatch call made below so the iteration budget bounds the
         /// *total* work for this one result, not just each individual call - otherwise a
@@ -1081,7 +1268,7 @@ protected:
         /// order and returns the instant any full match completes, so it can never skip a match
         /// that starts earlier in favor of one that starts later. Try that first.
         auto probe_it = events_it;
-        std::vector<T> whole_match;
+        EventIndices whole_match;
         if (backtrackingMatch<EventEntry, true>(probe_it, events_end, &whole_match, &context))
             return whole_match;
 
@@ -1100,7 +1287,7 @@ protected:
         while (anchor != events_end && !context.exhausted())
         {
             auto probe_anchor = anchor;
-            std::vector<T> current_match;
+            EventIndices current_match;
             backtrackingMatch<EventEntry, true, true>(probe_anchor, events_end, &current_match, &context);
 
             if (!current_match.empty())
@@ -1116,9 +1303,9 @@ protected:
     /// a partial one - a partial result is only ever returned when no complete match exists
     /// anywhere in the data, mirroring backtrackingMatchEventsFirst's own preference.
     template <typename EventEntry>
-    std::vector<T> backtrackingMatchEventsLast(EventEntry & events_it, const EventEntry events_end) const
+    EventIndices backtrackingMatchEventsLast(EventEntry & events_it, const EventEntry events_end) const
     {
-        std::vector<T> last_matched_events;
+        EventIndices last_matched_events;
         auto events_it_copy = events_it;
         bool found_complete_match = false;
 
@@ -1132,7 +1319,7 @@ protected:
         while (events_it_copy != events_end)
         {
             auto anchor = events_it_copy;
-            std::vector<T> current_match;
+            EventIndices current_match;
             bool match_result = backtrackingMatch<EventEntry, true>(events_it_copy, events_end, &current_match, &context);
 
             if (match_result)
@@ -1165,7 +1352,7 @@ protected:
         while (anchor != events_end)
         {
             auto probe_anchor = anchor;
-            std::vector<T> current_match;
+            EventIndices current_match;
             backtrackingMatch<EventEntry, true, true>(probe_anchor, events_end, &current_match, &context);
 
             /// Budget ran out before the scan finished, so the latest partial is unknown: no match.
@@ -1183,9 +1370,9 @@ protected:
 
     /// Find all non-overlapping matching sequences
     template <typename EventEntry>
-    std::vector<std::vector<T>> backtrackingMatchEventsAll(EventEntry & events_it, const EventEntry events_end) const
+    std::vector<EventIndices> backtrackingMatchEventsAll(EventEntry & events_it, const EventEntry events_end) const
     {
-        std::vector<std::vector<T>> all_matches;
+        std::vector<EventIndices> all_matches;
 
         /// Shared across every backtrackingMatch call made below (see backtrackingMatchEventsFirst).
         auto context = makeBacktrackingContext(static_cast<size_t>(events_end - events_it));
@@ -1194,7 +1381,7 @@ protected:
         while (events_it != events_end)
         {
             auto anchor = events_it;
-            std::vector<T> current_match;
+            EventIndices current_match;
             bool match_result = backtrackingMatch<EventEntry, true>(events_it, events_end, &current_match, &context);
 
             if (match_result)
@@ -1209,12 +1396,12 @@ protected:
 
         /// Phase 2: append at most one trailing partial - the latest anchor with any result.
         /// Drive the scan with a separate `anchor` iterator (see backtrackingMatchEventsLast).
-        std::vector<T> trailing_partial;
+        EventIndices trailing_partial;
         auto anchor = events_it;
         while (anchor != events_end)
         {
             auto probe_anchor = anchor;
-            std::vector<T> current_match;
+            EventIndices current_match;
             backtrackingMatch<EventEntry, true, true>(probe_anchor, events_end, &current_match, &context);
 
             /// Budget ran out before the scan finished, so the latest partial is unknown: keep
@@ -1327,6 +1514,10 @@ private:
     using DFAStates = std::vector<DFAState>;
 
 protected:
+    /// The condition (0-based) of each `(?N)` step of the pattern, in pattern order. The matcher records
+    /// matched events as a prefix of these steps, so the k-th recorded event matched step_conditions[k].
+    std::vector<size_t> step_conditions;
+
     /// `True` if the parsed pattern contains time assertions (?t...), `false` otherwise.
     bool pattern_has_time;
     /// sequenceMatch conditions met at least once in the pattern
@@ -1334,7 +1525,7 @@ protected:
 
 private:
     std::string pattern;
-    size_t arg_count;
+    size_t num_conditions;
     PatternActions actions;
 
     DFAStates dfa_states;
@@ -1402,18 +1593,17 @@ public:
         if (size)
         {
             typename ColumnVector<T>::Container & data_to = assert_cast<ColumnVector<T> &>(arr_to.getData()).getData();
+            const auto & events = this->data(place).events_list;
 
-            for (auto it : result_vec)
-            {
-                data_to.push_back(it);
-            }
+            for (auto index : result_vec)
+                data_to.push_back(events[index].first);
         }
     }
 
 private:
-    std::vector<T> getEvents(ConstAggregateDataPtr __restrict place) const
+    EventIndices getEvents(ConstAggregateDataPtr __restrict place) const
     {
-        std::vector<T> res;
+        EventIndices res;
         const auto & data_ref = this->data(place);
 
         const auto events_begin = std::begin(data_ref.events_list);
@@ -1452,18 +1642,17 @@ public:
         if (size)
         {
             typename ColumnVector<T>::Container & data_to = assert_cast<ColumnVector<T> &>(arr_to.getData()).getData();
+            const auto & events = this->data(place).events_list;
 
-            for (auto it : result_vec)
-            {
-                data_to.push_back(it);
-            }
+            for (auto index : result_vec)
+                data_to.push_back(events[index].first);
         }
     }
 
 private:
-    std::vector<T> getEvents(ConstAggregateDataPtr __restrict place) const
+    EventIndices getEvents(ConstAggregateDataPtr __restrict place) const
     {
-        std::vector<T> res;
+        EventIndices res;
         const auto & data_ref = this->data(place);
 
         const auto events_begin = std::begin(data_ref.events_list);
@@ -1502,18 +1691,17 @@ public:
         if (size)
         {
             typename ColumnVector<T>::Container & data_to = assert_cast<ColumnVector<T> &>(arr_to.getData()).getData();
+            const auto & events = this->data(place).events_list;
 
-            for (auto it : result_vec)
-            {
-                data_to.push_back(it);
-            }
+            for (auto index : result_vec)
+                data_to.push_back(events[index].first);
         }
     }
 
 private:
-    std::vector<T> getEvents(ConstAggregateDataPtr __restrict place) const
+    EventIndices getEvents(ConstAggregateDataPtr __restrict place) const
     {
-        std::vector<T> res;
+        EventIndices res;
         const auto & data_ref = this->data(place);
 
         const auto events_begin = std::begin(data_ref.events_list);
@@ -1553,12 +1741,11 @@ public:
         ColumnArray::Offsets & nested_offsets = nested_arr.getOffsets();
         typename ColumnVector<T>::Container & nested_data = assert_cast<ColumnVector<T> &>(nested_arr.getData()).getData();
 
+        const auto & events = this->data(place).events_list;
         for (const auto & match : all_matches)
         {
-            for (auto timestamp : match)
-            {
-                nested_data.push_back(timestamp);
-            }
+            for (auto index : match)
+                nested_data.push_back(events[index].first);
             nested_offsets.push_back(nested_offsets.back() + match.size());
         }
 
@@ -1566,7 +1753,7 @@ public:
     }
 
 private:
-    std::vector<std::vector<T>> getAllEvents(ConstAggregateDataPtr __restrict place) const
+    std::vector<EventIndices> getAllEvents(ConstAggregateDataPtr __restrict place) const
     {
         const auto & data_ref = this->data(place);
 
@@ -1577,6 +1764,140 @@ private:
         return this->backtrackingMatchEventsAll(events_it, events_end);
     }
 };
+
+/// Which matched chain(s) a WithCapture function reports: the same as its twin.
+enum class SequenceEventsVariant : uint8_t
+{
+    Longest, /// sequenceMatchEvents
+    First,
+    Last,
+    All,
+};
+
+/// sequenceMatchEvents*WithCapture(pattern)(timestamp, cond1, ..., condN, capture1, ..., captureN):
+/// the twin's result, with every event reported as (t, capture), where `capture` is the value of
+/// the capture argument of the condition of the pattern step the event matched, on the event's row.
+template <typename T, typename Data, SequenceEventsVariant variant>
+class AggregateFunctionSequenceMatchEventsWithCapture final
+    : public AggregateFunctionSequenceBase<T, Data, AggregateFunctionSequenceMatchEventsWithCapture<T, Data, variant>>
+{
+    using Base = AggregateFunctionSequenceBase<T, Data, AggregateFunctionSequenceMatchEventsWithCapture<T, Data, variant>>;
+
+public:
+    AggregateFunctionSequenceMatchEventsWithCapture(const DataTypes & arguments, const Array & params, const String & pattern_)
+        : Base(arguments, params, pattern_, makeResultType(arguments), (arguments.size() - 1) / 2)
+    {
+    }
+
+    String getName() const override
+    {
+        if constexpr (variant == SequenceEventsVariant::Longest)
+            return "sequenceMatchEventsWithCapture";
+        else if constexpr (variant == SequenceEventsVariant::First)
+            return "sequenceMatchEventsFirstWithCapture";
+        else if constexpr (variant == SequenceEventsVariant::Last)
+            return "sequenceMatchEventsLastWithCapture";
+        else
+            return "sequenceMatchEventsAllWithCapture";
+    }
+
+    bool allocatesMemoryInArena() const override { return true; }
+
+    /// The JSON type of the captures: that of the capture arguments that are not NULL literals (the
+    /// factory checks they all have the same one), or plain JSON if all of them are.
+    static DataTypePtr captureType(const DataTypes & arguments)
+    {
+        const size_t num_conditions = (arguments.size() - 1) / 2;
+        for (size_t i = 1 + num_conditions; i < arguments.size(); ++i)
+        {
+            auto type = removeNullable(arguments[i]);
+            if (!isNothing(type))
+                return type;
+        }
+        return DataTypeFactory::instance().get("JSON");
+    }
+
+    static DataTypePtr makeResultType(const DataTypes & arguments)
+    {
+        DataTypePtr event = std::make_shared<DataTypeTuple>(
+            DataTypes{arguments[0], makeNullable(captureType(arguments))}, Strings{"t", "capture"});
+        DataTypePtr chain = std::make_shared<DataTypeArray>(event);
+        if constexpr (variant == SequenceEventsVariant::All)
+            return std::make_shared<DataTypeArray>(chain);
+        else
+            return chain;
+    }
+
+    void insertResultInto(AggregateDataPtr __restrict place, IColumn & to, Arena *) const override
+    {
+        auto & data = this->data(place);
+        data.sort();
+
+        const auto events_begin = std::begin(data.events_list);
+        const auto events_end = std::end(data.events_list);
+        auto events_it = events_begin;
+
+        ColumnArray & arr_to = assert_cast<ColumnArray &>(to);
+        if constexpr (variant == SequenceEventsVariant::All)
+        {
+            const auto all_matches = this->backtrackingMatchEventsAll(events_it, events_end);
+            ColumnArray & chains_to = assert_cast<ColumnArray &>(arr_to.getData());
+            for (const auto & match : all_matches)
+                insertChain(data, match, chains_to);
+            arr_to.getOffsets().push_back(arr_to.getOffsets().back() + all_matches.size());
+        }
+        else
+        {
+            EventIndices match;
+            if constexpr (variant == SequenceEventsVariant::Longest)
+                match = this->backtrackingMatchEvents(events_it, events_end);
+            else if constexpr (variant == SequenceEventsVariant::First)
+                match = this->backtrackingMatchEventsFirst(events_it, events_end);
+            else
+                match = this->backtrackingMatchEventsLast(events_it, events_end);
+            insertChain(data, match, arr_to);
+        }
+    }
+
+private:
+    /// One chain as Array(Tuple(t, capture)).
+    void insertChain(const Data & data, const EventIndices & match, ColumnArray & chain_to) const
+    {
+        auto & event_to = assert_cast<ColumnTuple &>(chain_to.getData());
+        auto & timestamps_to = assert_cast<ColumnVector<T> &>(event_to.getColumn(0)).getData();
+        auto & captures_to = assert_cast<ColumnNullable &>(event_to.getColumn(1));
+
+        for (size_t step = 0; step < match.size(); ++step)
+        {
+            const size_t index = match[step];
+            timestamps_to.push_back(data.events_list[index].first);
+
+            /// The matcher records events as a prefix of the pattern's steps: this one matched step `step`.
+            const StringRef capture = data.capture(index, this->step_conditions[step]);
+            if (capture.size)
+            {
+                std::ignore = captures_to.getNestedColumn().deserializeAndInsertFromArena(capture.data);
+                captures_to.getNullMapData().push_back(0);
+            }
+            else
+                captures_to.insertDefault();
+        }
+        chain_to.getOffsets().push_back(chain_to.getOffsets().back() + match.size());
+    }
+};
+
+template <typename T, typename Data>
+using AggregateFunctionSequenceMatchEventsWithCaptureLongest
+    = AggregateFunctionSequenceMatchEventsWithCapture<T, Data, SequenceEventsVariant::Longest>;
+template <typename T, typename Data>
+using AggregateFunctionSequenceMatchEventsWithCaptureFirst
+    = AggregateFunctionSequenceMatchEventsWithCapture<T, Data, SequenceEventsVariant::First>;
+template <typename T, typename Data>
+using AggregateFunctionSequenceMatchEventsWithCaptureLast
+    = AggregateFunctionSequenceMatchEventsWithCapture<T, Data, SequenceEventsVariant::Last>;
+template <typename T, typename Data>
+using AggregateFunctionSequenceMatchEventsWithCaptureAll
+    = AggregateFunctionSequenceMatchEventsWithCapture<T, Data, SequenceEventsVariant::All>;
 
 template <typename T, typename Data>
 class AggregateFunctionSequenceCount final : public AggregateFunctionSequenceBase<T, Data, AggregateFunctionSequenceCount<T, Data>>
@@ -1672,6 +1993,70 @@ AggregateFunctionPtr createAggregateFunctionSequenceBase(
                     time_arg->getName(), name);
 }
 
+/// f(pattern)(timestamp, cond1, ..., condN, capture1, ..., captureN), 2 <= N <= max_events, conditions UInt8,
+/// captures JSON / Nullable(JSON) / NULL, all of the same JSON type.
+template <template <typename, typename> typename AggregateFunction, template <typename> typename Data>
+AggregateFunctionPtr createAggregateFunctionSequenceWithCapture(
+    const std::string & name, const DataTypes & argument_types, const Array & params, const Settings *)
+{
+    if (params.size() != 1)
+        throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH, "Aggregate function {} requires exactly one parameter.", name);
+
+    const auto arg_count = argument_types.size();
+    if (arg_count < 5)
+        throw Exception(ErrorCodes::TOO_FEW_ARGUMENTS_FOR_FUNCTION,
+            "Aggregate function {} requires a timestamp, at least 2 conditions and one capture per condition.", name);
+    if ((arg_count - 1) % 2 != 0)
+        throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
+            "Aggregate function {} requires a timestamp, the conditions and then exactly one capture per condition, "
+            "got {} arguments after the timestamp.", name, arg_count - 1);
+
+    const size_t num_conditions = (arg_count - 1) / 2;
+    if (num_conditions > max_events)
+        throw Exception(ErrorCodes::TOO_MANY_ARGUMENTS_FOR_FUNCTION, "Aggregate function {} supports up to {} event arguments.", name, max_events);
+
+    for (size_t i = 1; i <= num_conditions; ++i)
+    {
+        if (!isUInt8(argument_types[i]))
+            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                "Illegal type {} of argument {} of aggregate function {}, must be UInt8", argument_types[i]->getName(), i + 1, name);
+    }
+
+    DataTypePtr capture_type;
+    for (size_t i = num_conditions + 1; i < arg_count; ++i)
+    {
+        const auto type = removeNullable(argument_types[i]);
+        if (isNothing(type))
+            continue;
+        const auto * json_type = typeid_cast<const DataTypeObject *>(type.get());
+        if (!json_type || json_type->getSchemaFormat() != DataTypeObject::SchemaFormat::JSON)
+            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                "Illegal type {} of argument {} of aggregate function {}: a capture must be JSON, Nullable(JSON) or NULL",
+                argument_types[i]->getName(), i + 1, name);
+        if (!capture_type)
+            capture_type = type;
+        else if (!capture_type->equals(*type))
+            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                "Illegal type {} of argument {} of aggregate function {}: all captures must have the same JSON type, "
+                "but an earlier capture is {}", argument_types[i]->getName(), i + 1, name, capture_type->getName());
+    }
+
+    String pattern = params.front().safeGet<std::string>();
+
+    AggregateFunctionPtr res(createWithUnsignedIntegerType<AggregateFunction, Data>(*argument_types[0], argument_types, params, pattern));
+    if (res)
+        return res;
+
+    WhichDataType which(argument_types.front().get());
+    if (which.isDateTime())
+        return std::make_shared<AggregateFunction<DataTypeDateTime::FieldType, Data<DataTypeDateTime::FieldType>>>(argument_types, params, pattern);
+    if (which.isDate())
+        return std::make_shared<AggregateFunction<DataTypeDate::FieldType, Data<DataTypeDate::FieldType>>>(argument_types, params, pattern);
+
+    throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+        "Illegal type {} of first argument of aggregate function {}, must be DateTime", argument_types.front()->getName(), name);
+}
+
 }
 
 void registerAggregateFunctionsSequenceMatch(AggregateFunctionFactory & factory)
@@ -1682,6 +2067,14 @@ void registerAggregateFunctionsSequenceMatch(AggregateFunctionFactory & factory)
     factory.registerFunction("sequenceMatchEventsFirst", createAggregateFunctionSequenceBase<AggregateFunctionSequenceMatchEventsFirst, AggregateFunctionSequenceMatchData>);
     factory.registerFunction("sequenceMatchEventsLast", createAggregateFunctionSequenceBase<AggregateFunctionSequenceMatchEventsLast, AggregateFunctionSequenceMatchData>);
     factory.registerFunction("sequenceMatchEventsAll", createAggregateFunctionSequenceBase<AggregateFunctionSequenceMatchEventsAll, AggregateFunctionSequenceMatchData>);
+    factory.registerFunction("sequenceMatchEventsWithCapture",
+        createAggregateFunctionSequenceWithCapture<AggregateFunctionSequenceMatchEventsWithCaptureLongest, AggregateFunctionSequenceMatchCaptureData>);
+    factory.registerFunction("sequenceMatchEventsFirstWithCapture",
+        createAggregateFunctionSequenceWithCapture<AggregateFunctionSequenceMatchEventsWithCaptureFirst, AggregateFunctionSequenceMatchCaptureData>);
+    factory.registerFunction("sequenceMatchEventsLastWithCapture",
+        createAggregateFunctionSequenceWithCapture<AggregateFunctionSequenceMatchEventsWithCaptureLast, AggregateFunctionSequenceMatchCaptureData>);
+    factory.registerFunction("sequenceMatchEventsAllWithCapture",
+        createAggregateFunctionSequenceWithCapture<AggregateFunctionSequenceMatchEventsWithCaptureAll, AggregateFunctionSequenceMatchCaptureData>);
 }
 
 }
