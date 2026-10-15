@@ -11,7 +11,12 @@ RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-too
 ENV PATH=/root/.cargo/bin:$PATH
 
 ARG BRANCH
+ARG REVISION
 ARG REPOSITORY=https://github.com/Statwolf/ClickHouse.git
 WORKDIR /build
-RUN git clone --depth 1 --branch "${BRANCH}" "${REPOSITORY}" ClickHouse \
-    && cd ClickHouse && git submodule update --init --depth 1 --jobs 32
+# REVISION (the branch head when the build started) is part of this step, so a newer commit is never
+# served from the build cache; the clone must be at exactly that commit.
+RUN echo "building ${BRANCH} at ${REVISION}" \
+    && git clone --depth 1 --branch "${BRANCH}" "${REPOSITORY}" ClickHouse \
+    && cd ClickHouse && test "$(git rev-parse HEAD)" = "${REVISION}" \
+    && git submodule update --init --depth 1 --jobs 32
