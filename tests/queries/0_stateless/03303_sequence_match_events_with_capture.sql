@@ -65,7 +65,7 @@ SELECT sequenceMatchEventsAllWithCapture('(?1)(?2)')(t, bitTest(e, 0), bitTest(e
 SELECT sequenceMatchEventsAllWithCapture('(?1)')(t, bitTest(e, 0), NULL) FROM seq_capture; -- { serverError TOO_FEW_ARGUMENTS_FOR_FUNCTION }
 SELECT sequenceMatchEventsAllWithCapture('(?1)(?2)')(t, bitTest(e, 0), bitTest(e, 1), product, NULL) FROM seq_capture; -- { serverError ILLEGAL_TYPE_OF_ARGUMENT }
 SELECT sequenceMatchEventsAllWithCapture('(?1)(?2)')(t, bitTest(e, 0), bitTest(e, 1), map('a', 1)::JSON, map('a', 1)::JSON(a UInt8)) FROM seq_capture; -- { serverError ILLEGAL_TYPE_OF_ARGUMENT }
-SELECT sequenceMatchEventsAllWithCapture('(?1)(?2)')(t, e, bitTest(e, 1), NULL, NULL) FROM seq_capture; -- { serverError ILLEGAL_TYPE_OF_ARGUMENT }
+SELECT sequenceMatchEventsAllWithCapture('(?1)(?2)')(t, toUInt16(e), bitTest(e, 1), NULL, NULL) FROM seq_capture; -- { serverError ILLEGAL_TYPE_OF_ARGUMENT }
 SELECT sequenceMatchEventsAllWithCapture('(?1)(?3)')(t, bitTest(e, 0), bitTest(e, 1), NULL, NULL) FROM seq_capture; -- { serverError BAD_ARGUMENTS }
 SELECT sequenceMatchEventsAllWithCapture('(?1)(?2)')(toString(t), bitTest(e, 0), bitTest(e, 1), NULL, NULL) FROM seq_capture; -- { serverError ILLEGAL_TYPE_OF_ARGUMENT }
 
