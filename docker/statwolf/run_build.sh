@@ -14,7 +14,7 @@ mkdir -p out && rm -f out/clickhouse
 echo "== compile + link (capped: $MEMORY RAM, no extra swap, $CPUS cpus)"
 $D rm -f "ch-build-$TAG" >/dev/null 2>&1 || true
 $D run --rm --name "ch-build-$TAG" --memory="$MEMORY" --memory-swap="$MEMORY" --cpus="$CPUS" \
-    -e JOBS="$CPUS" -e LTO_JOBS=$(( CPUS * 3 / 4 )) -v "$PWD/build.sh:/build.sh:ro" -v "$PWD/out:/out" \
+    -e JOBS="$CPUS" -e LTO_JOBS=$(( CPUS * 3 / 4 )) -e CHECK_FIRST="${CHECK_FIRST:-}" -v "$PWD/build.sh:/build.sh:ro" -v "$PWD/out:/out" \
     "ch-toolchain-$TAG" bash /build.sh
 echo "== runtime image statwolf/clickhouse:$TAG"
 DOCKER_BUILDKIT=1 $D build --progress=plain -f Dockerfile -t "statwolf/clickhouse:$TAG" out

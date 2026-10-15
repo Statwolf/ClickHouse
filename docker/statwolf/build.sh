@@ -9,6 +9,12 @@ chmod +x /usr/local/bin/ld.lld-jobs
 mkdir -p /build/ClickHouse/build && cd /build/ClickHouse/build
 cmake -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20 \
     -DENABLE_TESTS=OFF -DCOMPILER_CACHE=disabled -DLLD_PATH=/usr/local/bin/ld.lld-jobs ..
+# Optional fail-fast: compile these objects first (space-separated ninja targets), e.g. the files being changed.
+if [ -n "${CHECK_FIRST:-}" ]; then
+    # shellcheck disable=SC2086
+    ninja -j "$JOBS" $CHECK_FIRST
+    echo "== CHECK_FIRST targets compiled"
+fi
 ninja -j "$JOBS" clickhouse
 llvm-objcopy-20 --strip-debug programs/clickhouse /out/clickhouse
 /out/clickhouse --version
