@@ -21,6 +21,7 @@
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <utility>
 #include <vector>
 
 
@@ -201,16 +202,21 @@ private:
         TimeLess,
         TimeGreaterOrEqual,
         TimeGreater,
-        TimeEqual
+        TimeEqual,
+        /// `(?t>=X&&t<=Y)`: the time since the previous event lies in the inclusive range [extra, upper]
+        TimeRange
     };
 
     struct PatternAction final
     {
         PatternActionType type;
         std::uint64_t extra;
+        /// inclusive upper bound of a TimeRange (`extra` is its inclusive lower bound)
+        std::uint64_t upper;
 
         PatternAction() = default;
-        explicit PatternAction(const PatternActionType type_, const std::uint64_t extra_ = 0) : type{type_}, extra{extra_} {}
+        explicit PatternAction(const PatternActionType type_, const std::uint64_t extra_ = 0, const std::uint64_t upper_ = 0)
+            : type{type_}, extra{extra_}, upper{upper_} {}
     };
 
     using PatternActions = PODArrayWithStackMemory<PatternAction, 64>;
@@ -253,26 +259,86 @@ private:
             {
                 if (match("t"))
                 {
-                    PatternActionType type;
+                    const auto parse_time_operand = [&]
+                    {
+                        PatternActionType operand_type = PatternActionType::TimeEqual;
+                        if (match("<="))
+                            operand_type = PatternActionType::TimeLessOrEqual;
+                        else if (match("<"))
+                            operand_type = PatternActionType::TimeLess;
+                        else if (match(">="))
+                            operand_type = PatternActionType::TimeGreaterOrEqual;
+                        else if (match(">"))
+                            operand_type = PatternActionType::TimeGreater;
+                        else if (match("=="))
+                            operand_type = PatternActionType::TimeEqual;
+                        else
+                            throw_exception("Unknown time condition");
 
-                    if (match("<="))
-                        type = PatternActionType::TimeLessOrEqual;
-                    else if (match("<"))
-                        type = PatternActionType::TimeLess;
-                    else if (match(">="))
-                        type = PatternActionType::TimeGreaterOrEqual;
-                    else if (match(">"))
-                        type = PatternActionType::TimeGreater;
-                    else if (match("=="))
-                        type = PatternActionType::TimeEqual;
-                    else
-                        throw_exception("Unknown time condition");
+                        UInt64 operand_duration = 0;
+                        const auto * prev_pos = pos;
+                        pos = tryReadIntText(operand_duration, pos, end);
+                        if (pos == prev_pos)
+                            throw_exception("Could not parse number");
+                        return std::pair{operand_type, operand_duration};
+                    };
 
-                    UInt64 duration = 0;
-                    const auto * prev_pos = pos;
-                    pos = tryReadIntText(duration, pos, end);
-                    if (pos == prev_pos)
-                        throw_exception("Could not parse number");
+                    auto [type, duration] = parse_time_operand();
+                    UInt64 range_upper = 0;
+
+                    /// A two-sided bound, e.g. '(?t>=86400&&t<=604800)': more than a day but at most a week
+                    /// after the previous event. Stored as one TimeRange action with inclusive bounds.
+                    if (match("&&"))
+                    {
+                        static constexpr auto equal_not_combinable
+                            = "Time condition 't==' cannot be combined with '&&', use it as a standalone condition";
+                        if (type == PatternActionType::TimeEqual)
+                            throw Exception(ErrorCodes::BAD_ARGUMENTS, equal_not_combinable);
+                        if (!match("t"))
+                            throw_exception("Expected 't' after '&&' in time condition "
+                                "(both operands must be written out, e.g. '(?t>=10&&t<=30)'), found");
+
+                        auto [second_type, second_duration] = parse_time_operand();
+                        if (second_type == PatternActionType::TimeEqual)
+                            throw Exception(ErrorCodes::BAD_ARGUMENTS, equal_not_combinable);
+                        if (pos + 2 <= end && 0 == memcmp(pos, "&&", 2))
+                            throw_exception("Only one '&&' is allowed in a time condition, found");
+
+                        const auto is_lower_bound = [](PatternActionType t)
+                        { return t == PatternActionType::TimeGreaterOrEqual || t == PatternActionType::TimeGreater; };
+                        if (is_lower_bound(type) == is_lower_bound(second_type))
+                            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                                "Time condition with '&&' must combine one lower bound ('t>' or 't>=') with one upper bound "
+                                "('t<' or 't<='), but both operands are {} bounds", is_lower_bound(type) ? "lower" : "upper");
+                        if (!is_lower_bound(type))
+                        {
+                            std::swap(type, second_type);
+                            std::swap(duration, second_duration);
+                        }
+
+                        UInt64 lower = duration;
+                        if (type == PatternActionType::TimeGreater)
+                        {
+                            if (duration == std::numeric_limits<UInt64>::max())
+                                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                                    "Time condition 't>{}' can never be satisfied, the range is empty", duration);
+                            lower = duration + 1;
+                        }
+                        UInt64 upper = second_duration;
+                        if (second_type == PatternActionType::TimeLess)
+                        {
+                            if (second_duration == 0)
+                                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Time condition 't<0' can never be satisfied, the range is empty");
+                            upper = second_duration - 1;
+                        }
+                        if (lower > upper)
+                            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                                "Time range is empty: inclusive lower bound {} is greater than inclusive upper bound {}", lower, upper);
+
+                        type = PatternActionType::TimeRange;
+                        duration = lower;
+                        range_upper = upper;
+                    }
 
                     if (actions.back().type != PatternActionType::SpecificEvent &&
                         actions.back().type != PatternActionType::AnyEvent &&
@@ -280,7 +346,7 @@ private:
                         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Temporal condition should be preceded by an event condition");
 
                     pattern_has_time = true;
-                    actions.emplace_back(type, duration);
+                    actions.emplace_back(type, duration, range_upper);
                 }
                 else
                 {
@@ -625,7 +691,23 @@ protected:
         if (condition.type == PatternActionType::TimeLessOrEqual || condition.type == PatternActionType::TimeEqual)
             return std::upper_bound(from, events_end, base->first + condition.extra,
                 [](const auto & value, const auto & event) { return value < event.first; });
+        if (condition.type == PatternActionType::TimeRange)
+            return std::upper_bound(from, events_end, condition.upper,
+                [&](UInt64 value, const auto & event) { return value < static_cast<UInt64>(event.first - base->first); });
         return events_end;
+    }
+
+    /// For `(?t>=X&&t<=Y)`: the first event from `from` on whose time since `base` is at least X (it may be
+    /// past Y already), or events_end. Equivalent to trying the events one by one, as events are sorted by time.
+    template <typename EventEntry>
+    EventEntry firstEventReachingRange(const PatternAction & condition, EventEntry from, EventEntry base, EventEntry events_end) const
+    {
+        const auto elapsed = [&](const auto & event) { return static_cast<UInt64>(event.first - base->first); };
+        for (size_t probe = 0; probe < 8 && from != events_end; ++probe, ++from)
+            if (elapsed(*from) >= condition.extra)
+                return from;
+        return std::lower_bound(from, events_end, condition.extra,
+            [&](const auto & event, UInt64 value) { return elapsed(event) < value; });
     }
 
     /// For `(?t>=..)`, `(?t>..)` and `(?t==..)`: the first event from `from` on that satisfies the
@@ -921,6 +1003,29 @@ protected:
                         break;
                 }
             }
+            else if (current.type == PatternActionType::TimeRange)
+            {
+                /// Like `(?t>=extra)` for events that come too early (they are skipped), and like
+                /// `(?t<=upper)` for an event that comes too late (backtrack: later events are later still).
+                const UInt64 elapsed = static_cast<UInt64>(events_it->first - base_it->first);
+                if (elapsed < current.extra)
+                {
+                    /// skip straight to the first later event that is not too early
+                    events_it = firstEventReachingRange(current, std::next(events_it), base_it, events_end);
+                    if (events_it == events_end && !do_backtrack())
+                        break;
+                }
+                else if (elapsed <= current.upper)
+                {
+                    back_stack.push_back({action, index_of(events_it), index_of(base_it)});
+                    base_it = events_it;
+                    ++action;
+                    if (!enter_state())
+                        break;
+                }
+                else if (!do_backtrack())
+                    break;
+            }
             else
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown PatternActionType");
 
@@ -941,7 +1046,8 @@ protected:
             && (actions[action].type == PatternActionType::KleeneStar
                 || actions[action].type == PatternActionType::TimeLessOrEqual
                 || actions[action].type == PatternActionType::TimeLess
-                || (actions[action].type == PatternActionType::TimeGreaterOrEqual && actions[action].extra == 0)))
+                || (actions[action].type == PatternActionType::TimeGreaterOrEqual && actions[action].extra == 0)
+                || (actions[action].type == PatternActionType::TimeRange && actions[action].extra == 0)))
             ++action;
 
         if (events_it == events_begin)
