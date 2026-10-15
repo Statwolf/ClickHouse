@@ -1,0 +1,17 @@
+# Toolchain + source for building this branch from source (see README.md in this directory).
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git cmake ninja-build python3 curl wget ca-certificates \
+        lsb-release software-properties-common gnupg nasm yasm file \
+    && rm -rf /var/lib/apt/lists/*
+# Same toolchain as the reference build: clang/lld 20 and the Rust nightly 25.4 builds with.
+RUN wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh && bash /tmp/llvm.sh 20 && rm /tmp/llvm.sh
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain nightly-2025-07-07 --component rust-src
+ENV PATH=/root/.cargo/bin:$PATH
+
+ARG BRANCH
+ARG REPOSITORY=https://github.com/Statwolf/ClickHouse.git
+WORKDIR /build
+RUN git clone --depth 1 --branch "${BRANCH}" "${REPOSITORY}" ClickHouse \
+    && cd ClickHouse && git submodule update --init --depth 1 --jobs 32
