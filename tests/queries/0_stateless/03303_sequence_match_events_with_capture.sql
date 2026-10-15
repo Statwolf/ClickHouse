@@ -53,7 +53,7 @@ SELECT sequenceMatchEventsWithCapture('(?1)(?t>=86400&&t<=604800)(?2)')(ts, e = 
 FROM values('ts DateTime(\'UTC\'), e UInt8', ('2026-01-01 00:00:00', 1), ('2026-01-01 06:00:00', 1), ('2026-01-03 00:00:00', 2)) FORMAT JSONEachRow;
 
 SELECT 'State / Merge';
-SELECT id, sequenceMatchEventsAllWithCaptureMerge(s)
+SELECT id, sequenceMatchEventsAllWithCaptureMerge('(?1).*(?2)')(s)
 FROM (
     SELECT id, sequenceMatchEventsAllWithCaptureState('(?1).*(?2)')(t, bitTest(e, 0), bitTest(e, 1), map('v', product)::JSON, map('p', product)::JSON) AS s
     FROM seq_capture GROUP BY id, t % 2

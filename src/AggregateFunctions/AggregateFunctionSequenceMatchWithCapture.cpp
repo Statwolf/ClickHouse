@@ -403,14 +403,18 @@ AggregateFunctionPtr createAggregateFunctionSequenceWithCapture(
 
 void registerAggregateFunctionsSequenceMatchWithCapture(AggregateFunctionFactory & factory)
 {
+    /// A NULL literal capture is valid (capture = NULL). Without this property the factory would not even
+    /// create the function for a NULL argument (it replaces it by one returning NULL), so the capture
+    /// arguments declared in getArgumentsThatCanBeOnlyNull would never be consulted.
+    AggregateFunctionProperties properties = { .returns_default_when_only_null = true };
     factory.registerFunction("sequenceMatchEventsWithCapture",
-        createAggregateFunctionSequenceWithCapture<AggregateFunctionSequenceMatchEventsWithCaptureLongest, AggregateFunctionSequenceMatchCaptureData>);
+        {createAggregateFunctionSequenceWithCapture<AggregateFunctionSequenceMatchEventsWithCaptureLongest, AggregateFunctionSequenceMatchCaptureData>, properties});
     factory.registerFunction("sequenceMatchEventsFirstWithCapture",
-        createAggregateFunctionSequenceWithCapture<AggregateFunctionSequenceMatchEventsWithCaptureFirst, AggregateFunctionSequenceMatchCaptureData>);
+        {createAggregateFunctionSequenceWithCapture<AggregateFunctionSequenceMatchEventsWithCaptureFirst, AggregateFunctionSequenceMatchCaptureData>, properties});
     factory.registerFunction("sequenceMatchEventsLastWithCapture",
-        createAggregateFunctionSequenceWithCapture<AggregateFunctionSequenceMatchEventsWithCaptureLast, AggregateFunctionSequenceMatchCaptureData>);
+        {createAggregateFunctionSequenceWithCapture<AggregateFunctionSequenceMatchEventsWithCaptureLast, AggregateFunctionSequenceMatchCaptureData>, properties});
     factory.registerFunction("sequenceMatchEventsAllWithCapture",
-        createAggregateFunctionSequenceWithCapture<AggregateFunctionSequenceMatchEventsWithCaptureAll, AggregateFunctionSequenceMatchCaptureData>);
+        {createAggregateFunctionSequenceWithCapture<AggregateFunctionSequenceMatchEventsWithCaptureAll, AggregateFunctionSequenceMatchCaptureData>, properties});
 }
 
 }
