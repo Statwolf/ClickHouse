@@ -24,4 +24,8 @@ State / Merge
 {"id":1,"sequenceMatchEventsAllWithCaptureMerge('(?1).*(?2)')(s)":[[{"t":0,"capture":{"v":"shoes"}},{"t":7,"capture":{"p":"hat"}}],[{"t":20,"capture":{"v":"bag"}},{"t":22,"capture":{"p":"bag"}}]]}
 {"id":2,"sequenceMatchEventsAllWithCaptureMerge('(?1).*(?2)')(s)":[[{"t":0,"capture":{"v":"shoes"}},{"t":100,"capture":{"p":"shoes"}}]]}
 {"id":3,"sequenceMatchEventsAllWithCaptureMerge('(?1).*(?2)')(s)":[[{"t":0,"capture":{"v":"shoes"}},{"t":5,"capture":{"p":"scarf"}}]]}
+State with a NULL literal capture
+{"id":1,"finalizeAggregation(s)":[[{"t":0,"capture":{"v":"shoes"}},{"t":7,"capture":null}],[{"t":20,"capture":{"v":"bag"}},{"t":22,"capture":null}]]}
+{"id":2,"finalizeAggregation(s)":[[{"t":0,"capture":{"v":"shoes"}}]]}
+{"id":3,"finalizeAggregation(s)":[[{"t":0,"capture":{"v":"shoes"}},{"t":5,"capture":null}]]}
 errors

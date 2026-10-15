@@ -60,6 +60,14 @@ FROM (
 )
 GROUP BY id ORDER BY id FORMAT JSONEachRow;
 
+SELECT 'State with a NULL literal capture';
+SELECT id, finalizeAggregation(s)
+FROM (
+    SELECT id, sequenceMatchEventsAllWithCaptureState('(?1)(?t>=1&&t<=7)(?2)')(t, bitTest(e, 0), bitTest(e, 1), map('v', product)::JSON, NULL) AS s
+    FROM seq_capture GROUP BY id
+)
+ORDER BY id FORMAT JSONEachRow;
+
 SELECT 'errors';
 SELECT sequenceMatchEventsAllWithCapture('(?1)(?2)')(t, bitTest(e, 0), bitTest(e, 1), NULL) FROM seq_capture; -- { serverError NUMBER_OF_ARGUMENTS_DOESNT_MATCH }
 SELECT sequenceMatchEventsAllWithCapture('(?1)')(t, bitTest(e, 0), NULL) FROM seq_capture; -- { serverError TOO_FEW_ARGUMENTS_FOR_FUNCTION }

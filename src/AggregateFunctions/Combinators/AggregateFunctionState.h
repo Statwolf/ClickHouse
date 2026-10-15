@@ -133,6 +133,11 @@ public:
     }
 
     AggregateFunctionPtr getNestedFunction() const override { return nested_func; }
+
+    /// The arguments are the nested function's: so are those it accepts as always NULL (e.g. the NULL
+    /// literal captures of sequenceMatchEvents*WithCapture), otherwise fooState(..., NULL) would be
+    /// replaced by a function returning NULL instead of the state of foo(..., NULL).
+    std::unordered_set<size_t> getArgumentsThatCanBeOnlyNull() const override { return nested_func->getArgumentsThatCanBeOnlyNull(); }
 };
 
 }
