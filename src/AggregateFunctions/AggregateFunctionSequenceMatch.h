@@ -1358,6 +1358,9 @@ protected:
     /// matched events as a prefix of these steps, so the k-th recorded event matched step_conditions[k].
     std::vector<size_t> step_conditions;
 
+    /// Number of condition arguments (after the timestamp).
+    size_t num_conditions;
+
     /// `True` if the parsed pattern contains time assertions (?t...), `false` otherwise.
     bool pattern_has_time;
     /// sequenceMatch conditions met at least once in the pattern
@@ -1365,7 +1368,6 @@ protected:
 
 private:
     std::string pattern;
-    size_t num_conditions;
     PatternActions actions;
 
     DFAStates dfa_states;

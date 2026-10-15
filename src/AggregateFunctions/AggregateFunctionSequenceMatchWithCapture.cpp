@@ -10,6 +10,8 @@
 #include <DataTypes/DataTypeTuple.h>
 #include <IO/VarInt.h>
 
+#include <unordered_set>
+
 namespace DB
 {
 
@@ -218,6 +220,23 @@ public:
     }
 
     bool allocatesMemoryInArena() const override { return true; }
+
+    /// A NULL capture is a value of the result (capture = NULL), not a row to skip: handle Nullable capture
+    /// arguments here rather than through the -Null combinator, which would drop those rows from matching ...
+    AggregateFunctionPtr getOwnNullAdapter(
+        const AggregateFunctionPtr & nested_function, const DataTypes &, const Array &, const AggregateFunctionProperties &) const override
+    {
+        return nested_function;
+    }
+
+    /// ... and would turn the whole function into NULL for a NULL literal capture.
+    std::unordered_set<size_t> getArgumentsThatCanBeOnlyNull() const override
+    {
+        std::unordered_set<size_t> captures;
+        for (size_t i = 1 + this->num_conditions; i <= 2 * this->num_conditions; ++i)
+            captures.insert(i);
+        return captures;
+    }
 
     /// The JSON type of the captures: that of the capture arguments that are not NULL literals (the
     /// factory checks they all have the same one), or plain JSON if all of them are.
