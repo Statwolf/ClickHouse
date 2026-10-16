@@ -4,6 +4,6 @@
 FROM clickhouse/clickhouse-server:25.4.5.24@sha256:69ced3e6e017fb652d77a0496858806f89fc54653dad8c3c6893939aa05e9833
 COPY --chown=root:root --chmod=555 clickhouse /usr/bin/clickhouse
 LABEL org.opencontainers.image.title="ClickHouse Server 25.4.5.24 (Statwolf sequenceMatch build)"
-LABEL org.opencontainers.image.version="25.4.5.24-sequencematch-fastmatch-timerange"
-LABEL org.opencontainers.image.source="https://github.com/Statwolf/ClickHouse/tree/sequencematch-fast-matcher-25.4.5.24"
-LABEL org.opencontainers.image.description="ClickHouse 25.4.5.24 + sequenceMatchEventsFirst/Last/All (#95318) + #118497 + #119871 + memoized sequenceMatch backtracking + two-sided time conditions (?t>=X&&t<=Y)"
+LABEL org.opencontainers.image.version="25.4.5.24-sequencematch-fastmatch-timerange-capture"
+LABEL org.opencontainers.image.source="https://github.com/Statwolf/ClickHouse/tree/sequencematch-fast-matcher-capture-25.4.5.24"
+LABEL org.opencontainers.image.description="ClickHouse 25.4.5.24 + #95318 + #118497 + #119871 + memoized sequenceMatch backtracking + (?t>=X&&t<=Y) + sequenceMatchEvents*WithCapture"
